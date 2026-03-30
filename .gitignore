@@ -1,0 +1,19 @@
+# Rocq build artifacts
+*.vo
+*.vos
+*.vok
+*.glob
+*.aux
+.*.aux
+.lia.cache
+
+# Raw extracted Scheme (generated from .v, the clean versions are kept)
+poc/poc.scm
+boilerplate/boilerplate.scm
+
+
+# Shamrocq compiler output (regenerable from .scm)
+**/out/bytecode.bin
+**/out/funcs.rs
+**/out/ctors.rs
+**/out/foreign_fns.rs

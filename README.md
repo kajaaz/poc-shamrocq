@@ -68,7 +68,8 @@ poc-shamrocq/
 │   ├── _CoqProject
 │   └── Makefile
 ├── tests/
-│   └── poc_boilerplate.rs       # Shamrocq VM test suite (11 tests)
+│   ├── poc_boilerplate.rs       # Shamrocq VM test suite (11 tests)
+│   └── baremetal_main.rs        # Drop-in main.rs for bare-metal firmware
 └── README.md                    # This file
 ```
 
@@ -148,6 +149,10 @@ cd boilerplate && make    # produces boilerplate.scm
 
 ### Step 2 — Strip the extraction header
 
+Rocq's Scheme extraction inserts `(load "macros_extr.scm")` at the top of
+the output. This must be removed because `shamrocq-compiler` handles the
+required macros (`lambdas`, `@`, `match`, quasiquote) natively.
+
 ```sh
 grep -v '(load ' poc/poc.scm > poc/poc_clean.scm
 grep -v '(load ' boilerplate/boilerplate.scm > boilerplate/boilerplate_clean.scm
@@ -162,95 +167,155 @@ shamrocq-compiler -o boilerplate/out/ boilerplate/boilerplate_clean.scm
 
 ### Step 4 — Run tests on the Shamrocq VM
 
+This repo does not duplicate the shamrocq build infrastructure. Instead,
+the `tests/` directory contains files that are copied into a local
+[shamrocq](https://github.com/vbergeron/shamrocq) clone to run.
+
 ```sh
-# from your local shamrocq clone — copy our files
+# copy our files into your local shamrocq clone
 cp poc/poc_clean.scm /path/to/shamrocq/scheme/poc.scm
 cp tests/poc_boilerplate.rs /path/to/shamrocq/crates/shamrocq/tests/poc_boilerplate.rs
+
+# run the tests
 cd /path/to/shamrocq
 cargo test --test poc_boilerplate -- --nocapture
 ```
 
-### Step 5 — Build bare-metal binary and measure size
+### Step 5 — Build and run the bare-metal firmware
 
-To get the actual firmware size on a Cortex-M4 target:
+The bare-metal firmware is built using shamrocq's existing
+`examples/baremetal/` scaffold. We provide a drop-in `main.rs` and Scheme
+file — the scaffold itself (Cargo.toml, build.rs, memory.x, linker config)
+stays in the shamrocq repo and does not need to be duplicated.
 
 ```sh
+# copy our files into the shamrocq baremetal example
+cp boilerplate/boilerplate_clean.scm /path/to/shamrocq/examples/baremetal/scheme/demo.scm
+cp tests/baremetal_main.rs /path/to/shamrocq/examples/baremetal/src/main.rs
+
 # install the bare-metal target if not already done
 rustup target add thumbv7em-none-eabihf
 
-# go to the shamrocq baremetal example
+# build and measure size
 cd /path/to/shamrocq/examples/baremetal
-
-# replace the demo scheme with our boilerplate code
-cp /path/to/poc-shamrocq/boilerplate/boilerplate_clean.scm scheme/demo.scm
-
-# build in release mode (opt-level "s", LTO enabled)
 cargo build --release
+size target/thumbv7em-none-eabihf/release/shamrocq-baremetal
 
-# measure the binary size
-arm-none-eabi-size target/thumbv7em-none-eabihf/release/shamrocq-baremetal
-# or, if cargo-binutils is installed:
-cargo size --release
+# run on QEMU (requires qemu-system-arm)
+cargo run --release
 ```
 
-The `text` column in the output is the total flash footprint (VM runtime +
-bytecode + glue code).
+Expected output:
+
+```
+check_encoding("Hello") = true
+deserialize OK: nonce=8 to=20 value=8 memo=1
+deserialize(5 bytes) rejected = true
+--- all checks passed ---
+```
+
+To restore the shamrocq example to its original state:
+
+```sh
+cd /path/to/shamrocq/examples/baremetal
+git checkout -- scheme/demo.scm src/main.rs
+```
 
 ### Measured results (boilerplate transaction module)
 
-| Component | Size |
-|---|---|
-| Shamrocq VM runtime (baseline, no app bytecode) | 11,872 bytes `.text` |
-| Boilerplate bytecode (`bytecode.bin`) | 9,171 bytes |
-| **Total bare-metal firmware** | **22,012 bytes `.text`** |
-| Ledger FLASH budget (`memory.x`) | 16,384 bytes (16 KB) |
-| **Overflow** | **5,628 bytes over budget** |
+| Component | Before optimization | After `Extract Constant` |
+|---|---|---|
+| Boilerplate bytecode (`bytecode.bin`) | 9,171 bytes | **1,263 bytes** |
+| Extracted Scheme lines | 183 | 108 |
+| **Total bare-metal firmware (`.text`)** | **21,428 bytes** | **13,432 bytes** |
+| Ledger FLASH budget (`memory.x`) | 16,384 bytes (16 KB) | 16,384 bytes |
 
 > Measured on `thumbv7em-none-eabihf`, release mode, `opt-level = "s"`, LTO
 > enabled. The equivalent C transaction module compiles to ~1–2 KB `.text`.
 
-The firmware does not fit in 16 KB FLASH today. See
-[Current limitations](#current-limitations) for the path to reducing this.
+The `Extract Constant` workaround reduced bytecode by **86%** (9.2 KB →
+1.3 KB) and brought the total bare-metal firmware from 21.4 KB down to
+**13.4 KB** — now fitting within the 16 KB Ledger FLASH budget with
+~3 KB to spare. See [Peano bloat workaround](#peano-bloat-and-the-extract-constant-workaround)
+below.
+
+## Peano bloat and the `Extract Constant` workaround
+
+Rocq's default `nat` type is Peano-encoded: every number N is represented
+as N nested `S(S(S(...O...)))` constructors. When extracting to Scheme,
+constants like `MAX_TX_LEN = 510` become enormous nested trees, inflating
+bytecode.
+
+**The problem:** `Extract Inductive nat` (the standard Rocq directive to
+replace the entire `nat` type with native integers) does not work with
+shamrocq-compiler. Rocq wraps the replacement constructors in quasiquote
+syntax (`` `((lambda (n) (+ n 1)) ,x) ``), but shamrocq expects atoms
+as quasiquote list heads. This needs upstream shamrocq support.
+
+**The workaround:** every numeric literal used in the code was given a
+named Rocq `Definition`, then extracted directly to a native Scheme integer
+using `Extract Constant`:
+
+```coq
+Definition NONCE_LEN : nat := 8.
+Definition VALUE_LEN : nat := 8.
+Definition MAX_ASCII : nat := 127.
+
+Extract Constant NONCE_LEN => "8".
+Extract Constant VALUE_LEN => "8".
+Extract Constant MAX_ASCII => "127".
+(* same for MAX_TX_LEN, ADDRESS_LEN, MAX_MEMO_LEN *)
+```
+
+This produces `(define nONCE_LEN 8)` in Scheme instead of 8 nested `S`
+constructors — and the proofs are unaffected because Rocq unfolds these
+definitions during type-checking.
+
+**Result:** bytecode dropped from **9,171 → 1,263 bytes** (86% reduction),
+Scheme from 183 → 108 lines.
 
 ## Current limitations
 
-### Does not fit in 16 KB FLASH
+### Bare-metal firmware fits in 16 KB
 
-The bare-metal binary (22 KB) exceeds the Ledger device budget (16 KB) by
-~6 KB. The two main contributors:
+After the `Extract Constant` optimization, the bare-metal firmware is
+**13,432 bytes** (`.text`) — fitting within the 16 KB Ledger FLASH
+budget with 2,952 bytes to spare. Before the optimization it was 21,428
+bytes and overflowed by ~5 KB.
 
-1. **Shamrocq VM runtime (~12 KB)** — this is the interpreter itself,
-   which is a fixed cost shared by all bytecode programs.
-2. **Peano-encoded constants (~7 KB of bytecode)** — `MAX_TX_LEN` (510),
-   `MAX_MEMO_LEN` (465), and `127` each expand into hundreds of nested
-   `S(S(S(...O...)))` constructor chains because Rocq's default `nat`
-   extracts to Peano naturals.
+### `Extract Inductive nat` not yet supported
 
-### Path to fitting in 16 KB
+The more general `Extract Inductive nat` directive (which would eliminate
+**all** Peano encoding, not just named constants) does not work with
+shamrocq-compiler today. The `Extract Constant` workaround covers the
+named constants but small inline numbers (e.g., loop counters) may still
+use Peano encoding. See the comment in `Boilerplate.v` for the exact
+directives, ready to uncomment once shamrocq adds support.
+
+### Path to further optimization
 
 | Optimization | Expected saving | Difficulty |
 |---|---|---|
-| `Extract Inductive nat` — map `nat` to Scheme integers | ~7 KB bytecode | Low (Rocq directive) |
-| Shamrocq FFI for integer constants (`foreign_fn`) | ~7 KB bytecode | Low (host-side) |
+| `Extract Inductive nat` upstream support in shamrocq | Eliminates all remaining Peano | Medium (upstream) |
 | VM size reduction (unused opcode removal, etc.) | ~1–3 KB | Medium (upstream) |
 
-With `Extract Inductive nat` alone, the bytecode drops from 9.2 KB to
-~2 KB, bringing total firmware to ~14 KB — within the 16 KB budget.
-
-### No direct bare-metal output
+### Bare-metal build uses shamrocq's scaffold
 
 `shamrocq-compiler` produces bytecode for the Shamrocq VM, not a standalone
 `.elf`. The final firmware is built from the shamrocq repo's
-`examples/baremetal/` scaffold, which embeds the bytecode via
-`include_bytes!` and compiles the VM + bytecode together.
+`examples/baremetal/` scaffold, which provides the `no_std` VM runtime,
+linker script, and build infrastructure. We only provide a drop-in
+`main.rs` and the Scheme file — we don't duplicate the scaffold to avoid
+maintaining a copy that can go out of sync with upstream.
 
 ## Roadmap
 
 - [x] Rocq spec + proofs + Scheme extraction
 - [x] Shamrocq bytecode compilation
 - [x] VM-level test suite (11 tests passing)
-- [x] Bare-metal binary build + size measurement (22,012 B, overflows 16 KB by 5.6 KB)
-- [ ] `Extract Inductive nat` optimization (expected to bring total under 16 KB)
+- [x] Bare-metal binary build + size measurement
+- [x] `Extract Constant` workaround — bytecode 9.2 KB → 1.3 KB, firmware 21.4 KB → **13.4 KB** (fits in 16 KB)
+- [ ] `Extract Inductive nat` upstream support in shamrocq (eliminates all Peano encoding)
 - [ ] Marshalling layer for raw byte buffers (FFI)
 - [ ] Replace `transaction_deserialize()` in app-boilerplate
 - [ ] Validate with Speculos + Ragger test suite

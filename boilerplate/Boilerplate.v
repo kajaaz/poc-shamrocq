@@ -126,6 +126,9 @@ Definition tx_memo (tx : transaction) : list nat :=
 Definition MAX_TX_LEN : nat := 510.
 Definition ADDRESS_LEN : nat := 20.
 Definition MAX_MEMO_LEN : nat := 465.
+Definition NONCE_LEN : nat := 8.
+Definition VALUE_LEN : nat := 8.
+Definition MAX_ASCII : nat := 127.
 
 (* ================================================================== *)
 (** * utils.c — check_encoding                                        *)
@@ -146,7 +149,7 @@ Fixpoint check_encoding (memo : list nat) : bool :=
   match memo with
   | nil => true
   | b :: rest =>
-    if leb b 127 then check_encoding rest
+    if leb b MAX_ASCII then check_encoding rest
     else false
   end.
 
@@ -156,17 +159,17 @@ Fixpoint check_encoding (memo : list nat) : bool :=
 
 Theorem check_encoding_spec : forall memo,
   check_encoding memo = true <->
-  (forall b, In b memo -> b <= 127).
+  (forall b, In b memo -> b <= MAX_ASCII).
 Proof.
   induction memo as [|x xs IH]; simpl.
   - split; intros; [contradiction | reflexivity].
   - split; intro H.
-    + destruct (leb x 127) eqn:E; [|discriminate].
+    + destruct (leb x MAX_ASCII) eqn:E; [|discriminate].
       apply leb_iff in E. intros b [Hb | Hb].
       * subst. exact E.
       * apply IH; [exact H | exact Hb].
-    + assert (Hx : x <= 127) by (apply H; left; reflexivity).
-      apply (proj2 (leb_iff x 127)) in Hx. rewrite Hx.
+    + assert (Hx : x <= MAX_ASCII) by (apply H; left; reflexivity).
+      apply (proj2 (leb_iff x MAX_ASCII)) in Hx. rewrite Hx.
       apply IH. intros b Hb. apply H. right. exact Hb.
 Qed.
 
@@ -206,13 +209,13 @@ Definition format_memo_check (memo_len dst_len : nat) : bool :=
 Definition deserialize_transaction (data : list nat)
   : parser_status + transaction :=
   if leb (length data) MAX_TX_LEN then
-    match parse_field 8 data with
+    match parse_field NONCE_LEN data with
     | None => inl NONCE_PARSING_ERROR
     | Some (nonce, rest1) =>
       match parse_field ADDRESS_LEN rest1 with
       | None => inl TO_PARSING_ERROR
       | Some (to_addr, rest2) =>
-        match parse_field 8 rest2 with
+        match parse_field VALUE_LEN rest2 with
         | None => inl VALUE_PARSING_ERROR
         | Some (value, memo) =>
           if leb (length memo) MAX_MEMO_LEN then
@@ -238,13 +241,13 @@ Definition deserialize_transaction (data : list nat)
 
 Theorem deserialize_nonce_len : forall data tx,
   deserialize_transaction data = inr tx ->
-  length (tx_nonce tx) = 8.
+  length (tx_nonce tx) = NONCE_LEN.
 Proof.
   unfold deserialize_transaction; intros data tx H.
   destruct (leb (length data) MAX_TX_LEN); [|discriminate].
-  destruct (parse_field 8 data) as [[nonce rest1]|] eqn:E1; [|discriminate].
+  destruct (parse_field NONCE_LEN data) as [[nonce rest1]|] eqn:E1; [|discriminate].
   destruct (parse_field ADDRESS_LEN rest1) as [[to_addr rest2]|] eqn:E2; [|discriminate].
-  destruct (parse_field 8 rest2) as [[value memo]|] eqn:E3; [|discriminate].
+  destruct (parse_field VALUE_LEN rest2) as [[value memo]|] eqn:E3; [|discriminate].
   destruct (leb (length memo) MAX_MEMO_LEN); [|discriminate].
   destruct (check_encoding memo); [|discriminate].
   inversion H; subst; clear H. simpl.
@@ -257,9 +260,9 @@ Theorem deserialize_to_len : forall data tx,
 Proof.
   unfold deserialize_transaction; intros data tx H.
   destruct (leb (length data) MAX_TX_LEN); [|discriminate].
-  destruct (parse_field 8 data) as [[nonce rest1]|] eqn:E1; [|discriminate].
+  destruct (parse_field NONCE_LEN data) as [[nonce rest1]|] eqn:E1; [|discriminate].
   destruct (parse_field ADDRESS_LEN rest1) as [[to_addr rest2]|] eqn:E2; [|discriminate].
-  destruct (parse_field 8 rest2) as [[value memo]|] eqn:E3; [|discriminate].
+  destruct (parse_field VALUE_LEN rest2) as [[value memo]|] eqn:E3; [|discriminate].
   destruct (leb (length memo) MAX_MEMO_LEN); [|discriminate].
   destruct (check_encoding memo); [|discriminate].
   inversion H; subst; clear H. simpl.
@@ -268,13 +271,13 @@ Qed.
 
 Theorem deserialize_value_len : forall data tx,
   deserialize_transaction data = inr tx ->
-  length (tx_value tx) = 8.
+  length (tx_value tx) = VALUE_LEN.
 Proof.
   unfold deserialize_transaction; intros data tx H.
   destruct (leb (length data) MAX_TX_LEN); [|discriminate].
-  destruct (parse_field 8 data) as [[nonce rest1]|] eqn:E1; [|discriminate].
+  destruct (parse_field NONCE_LEN data) as [[nonce rest1]|] eqn:E1; [|discriminate].
   destruct (parse_field ADDRESS_LEN rest1) as [[to_addr rest2]|] eqn:E2; [|discriminate].
-  destruct (parse_field 8 rest2) as [[value memo]|] eqn:E3; [|discriminate].
+  destruct (parse_field VALUE_LEN rest2) as [[value memo]|] eqn:E3; [|discriminate].
   destruct (leb (length memo) MAX_MEMO_LEN); [|discriminate].
   destruct (check_encoding memo); [|discriminate].
   inversion H; subst; clear H. simpl.
@@ -287,9 +290,9 @@ Theorem deserialize_memo_bounded : forall data tx,
 Proof.
   unfold deserialize_transaction; intros data tx H.
   destruct (leb (length data) MAX_TX_LEN); [|discriminate].
-  destruct (parse_field 8 data) as [[nonce rest1]|] eqn:E1; [|discriminate].
+  destruct (parse_field NONCE_LEN data) as [[nonce rest1]|] eqn:E1; [|discriminate].
   destruct (parse_field ADDRESS_LEN rest1) as [[to_addr rest2]|] eqn:E2; [|discriminate].
-  destruct (parse_field 8 rest2) as [[value memo]|] eqn:E3; [|discriminate].
+  destruct (parse_field VALUE_LEN rest2) as [[value memo]|] eqn:E3; [|discriminate].
   destruct (leb (length memo) MAX_MEMO_LEN) eqn:Elen; [|discriminate].
   destruct (check_encoding memo); [|discriminate].
   inversion H; subst; clear H. simpl.
@@ -298,13 +301,13 @@ Qed.
 
 Theorem deserialize_encoding_valid : forall data tx,
   deserialize_transaction data = inr tx ->
-  forall b, In b (tx_memo tx) -> b <= 127.
+  forall b, In b (tx_memo tx) -> b <= MAX_ASCII.
 Proof.
   unfold deserialize_transaction; intros data tx H.
   destruct (leb (length data) MAX_TX_LEN); [|discriminate].
-  destruct (parse_field 8 data) as [[nonce rest1]|] eqn:E1; [|discriminate].
+  destruct (parse_field NONCE_LEN data) as [[nonce rest1]|] eqn:E1; [|discriminate].
   destruct (parse_field ADDRESS_LEN rest1) as [[to_addr rest2]|] eqn:E2; [|discriminate].
-  destruct (parse_field 8 rest2) as [[value memo]|] eqn:E3; [|discriminate].
+  destruct (parse_field VALUE_LEN rest2) as [[value memo]|] eqn:E3; [|discriminate].
   destruct (leb (length memo) MAX_MEMO_LEN); [|discriminate].
   destruct (check_encoding memo) eqn:Enc; [|discriminate].
   inversion H; subst; clear H. simpl.
@@ -317,9 +320,9 @@ Theorem deserialize_preserves_data : forall data tx,
 Proof.
   unfold deserialize_transaction; intros data tx H.
   destruct (leb (length data) MAX_TX_LEN); [|discriminate].
-  destruct (parse_field 8 data) as [[nonce rest1]|] eqn:E1; [|discriminate].
+  destruct (parse_field NONCE_LEN data) as [[nonce rest1]|] eqn:E1; [|discriminate].
   destruct (parse_field ADDRESS_LEN rest1) as [[to_addr rest2]|] eqn:E2; [|discriminate].
-  destruct (parse_field 8 rest2) as [[value memo]|] eqn:E3; [|discriminate].
+  destruct (parse_field VALUE_LEN rest2) as [[value memo]|] eqn:E3; [|discriminate].
   destruct (leb (length memo) MAX_MEMO_LEN); [|discriminate].
   destruct (check_encoding memo); [|discriminate].
   inversion H; subst; clear H. simpl.
@@ -335,6 +338,22 @@ Qed.
 
 From Stdlib Require Extraction.
 Extraction Language Scheme.
+
+(* Map all numeric constants to native Scheme integers.
+   This avoids Peano S(S(S(...O...))) chains in the extracted code. *)
+Extract Constant MAX_TX_LEN   => "510".
+Extract Constant ADDRESS_LEN  => "20".
+Extract Constant MAX_MEMO_LEN => "465".
+Extract Constant NONCE_LEN    => "8".
+Extract Constant VALUE_LEN    => "8".
+Extract Constant MAX_ASCII    => "127".
+
+(* NOTE: Extract Inductive nat (to eliminate ALL Peano encoding) does not
+   work with shamrocq-compiler yet — Rocq wraps the replacement in
+   quasiquote but shamrocq expects constructor names as quasiquote heads.
+   This needs upstream shamrocq support for native integers in quasiquote.
+   For now, naming all literals as constants + Extract Constant is the
+   workaround. *)
 
 Definition boilerplate_exports :=
   (check_encoding, format_memo_check,

@@ -37,45 +37,70 @@ Boilerplate.v ──rocq compile──▶ boilerplate.scm ──shamrocq-compile
 
 | Metric | C (app-boilerplate) | Rocq / Shamrocq |
 |---|---|---|
-| Source lines (logic only) | ~130 lines across 4 files | 155 lines in `Boilerplate.v` |
-| Source lines (total) | ~250 lines (incl. headers, includes) | 344 lines (incl. 190 lines of proofs) |
-| Extracted Scheme | — | 183 lines (`boilerplate_clean.scm`) |
-| Bytecode only | — | 9,171 bytes (`bytecode.bin`) |
-| VM runtime (baseline) | — | 11,872 bytes `.text` (no app bytecode) |
-| **Total bare-metal `.text`** | **~1–2 KB** (estimated) | **22,012 bytes** (measured) |
-| **Fits in 16 KB FLASH?** | Yes | **No** (overflows by 5,628 bytes) |
+| Source lines (logic only) | ~130 lines across 4 files | 160 lines in `Boilerplate.v` |
+| Source lines (total) | ~250 lines (incl. headers, includes) | 363 lines (incl. proofs + extraction) |
+| Extracted Scheme | — | 108 lines (`boilerplate_clean.scm`) |
+| Bytecode | — | **1,263 bytes** (`bytecode.bin`) |
+| **Total bare-metal firmware (`.text`)** | **~1–2 KB** | **13,432 bytes** (measured) |
 
-> **Measured on:** `thumbv7em-none-eabihf`, release mode, `opt-level = "s"`,
-> LTO enabled, using `shamrocq/examples/baremetal/` scaffold.
-> VM baseline (11,872 B) was measured with the original demo Scheme program.
+### Peano bloat and the `Extract Constant` workaround
 
-The bytecode is ~10 KB, and the VM runtime adds ~12 KB, for a total of
-**~22 KB** — exceeding the 16 KB FLASH budget by ~6 KB.
+Rocq's default `nat` type is Peano-encoded: `S(S(S(...O...)))`. When
+extracting to Scheme, a constant like `MAX_TX_LEN = 510` becomes 510
+nested `S` constructors — producing massive, unreadable Scheme code and
+inflated bytecode.
 
-Most of the bytecode bloat comes from **Peano-encoded constants** —
-`MAX_TX_LEN` (510), `MAX_MEMO_LEN` (465), and `127` each expand into
-hundreds of nested `S(S(S(...O...)))` constructor chains in the Scheme
-output (see lines 49–121 of `boilerplate_clean.scm`). This is a known
-limitation of Rocq's default `nat` extraction.
+**Before optimization:** 9,171 bytes of bytecode, 183 lines of Scheme.
+The constants `MAX_TX_LEN` (510), `MAX_MEMO_LEN` (465), `127`, `20`, `8`
+alone accounted for ~7 KB of Peano chains.
 
-### How to reduce bytecode size
+**Fix applied:** every numeric literal in the code was given a named
+Rocq `Definition`, then extracted to a native Scheme integer using
+`Extract Constant`:
 
-- **`Extract Inductive nat`** — tell Rocq to map `nat` to Scheme integers
-  instead of Peano constructors. Removes ~7 KB of constant encoding.
-- **Shamrocq FFI for integer constants** — use `foreign_fn` to provide
-  `MAX_TX_LEN` etc. as native 32-bit words from the host.
-- Both approaches are straightforward; the current PoC intentionally uses
-  unoptimized extraction to show the baseline.
+```coq
+Definition NONCE_LEN : nat := 8.
+Definition VALUE_LEN : nat := 8.
+Definition MAX_ASCII : nat := 127.
+(* MAX_TX_LEN, ADDRESS_LEN, MAX_MEMO_LEN already existed *)
+
+Extract Constant MAX_TX_LEN   => "510".
+Extract Constant ADDRESS_LEN  => "20".
+Extract Constant MAX_MEMO_LEN => "465".
+Extract Constant NONCE_LEN    => "8".
+Extract Constant VALUE_LEN    => "8".
+Extract Constant MAX_ASCII    => "127".
+```
+
+This produces clean Scheme like `(define mAX_TX_LEN 510)` instead of
+510 nested `S` constructors.
+
+**After optimization:** 1,263 bytes of bytecode, 108 lines of Scheme.
+**86% reduction** in bytecode size.
+
+The proofs are unaffected — Rocq unfolds these definitions during
+proof-checking, so `NONCE_LEN` and `8` are identical from the proof
+engine's perspective.
+
+### Why not `Extract Inductive nat`?
+
+A more general approach is `Extract Inductive nat` which replaces the
+entire `nat` type with native integers. However, this does not work
+with shamrocq-compiler: Rocq's extraction wraps the replacement
+constructors in quasiquote syntax (`` `((lambda (n) (+ n 1)) ,x) ``),
+but shamrocq expects constructor names (atoms) as quasiquote heads.
+This needs upstream shamrocq support. See the comment in `Boilerplate.v`
+for the exact directives, ready to uncomment once shamrocq supports them.
 
 ## Functionality comparison
 
 | Feature | C | Rocq/Shamrocq |
 |---|---|---|
-| Parse nonce (8 bytes) | pointer arithmetic | `parse_field 8 data` |
+| Parse nonce (8 bytes) | pointer arithmetic | `parse_field NONCE_LEN data` |
 | Parse to address (20 bytes) | pointer arithmetic | `parse_field ADDRESS_LEN rest` |
-| Parse value (8 bytes) | pointer arithmetic | `parse_field 8 rest` |
+| Parse value (8 bytes) | pointer arithmetic | `parse_field VALUE_LEN rest` |
 | Memo length check (≤ 465) | `if (offset + memo_len > buf_len)` | `leb (length memo) MAX_MEMO_LEN` |
-| Memo ASCII check (≤ 0x7F) | `for` loop | `check_encoding` (recursive) |
+| Memo ASCII check (≤ 0x7F) | `for` loop | `check_encoding` (recursive, uses `MAX_ASCII`) |
 | Error codes | `return NONCE_PARSING_ERROR` etc. | `inl NONCE_PARSING_ERROR` etc. |
 | Return parsed struct | fill `transaction_t` by pointer | `inr (MkTransaction ...)` |
 
@@ -89,11 +114,11 @@ successful parse:
 
 | Theorem | Statement |
 |---|---|
-| `deserialize_nonce_len` | `length (tx_nonce tx) = 8` |
+| `deserialize_nonce_len` | `length (tx_nonce tx) = NONCE_LEN` |
 | `deserialize_to_len` | `length (tx_to tx) = ADDRESS_LEN` |
-| `deserialize_value_len` | `length (tx_value tx) = 8` |
+| `deserialize_value_len` | `length (tx_value tx) = VALUE_LEN` |
 | `deserialize_memo_bounded` | `length (tx_memo tx) ≤ MAX_MEMO_LEN` |
-| `deserialize_encoding_valid` | every byte in `tx_memo tx` is ≤ 127 |
+| `deserialize_encoding_valid` | every byte in `tx_memo tx` is ≤ `MAX_ASCII` |
 | `deserialize_preserves_data` | `nonce ++ to ++ value ++ memo = data` (no data lost or corrupted) |
 
 These are **compile-time guarantees** — they cannot be violated regardless of
@@ -143,34 +168,27 @@ let result = vm.call(funcs::DESERIALIZE_TRANSACTION, &[input]).unwrap();
 
 ## Measuring the bare-metal binary size
 
-To get the **actual** flash footprint (VM + bytecode + glue), build the
-shamrocq baremetal example with our bytecode:
+To get the **actual** flash footprint (VM + bytecode + glue), use the
+shamrocq baremetal scaffold with our files (see `tests/baremetal_main.rs`
+for a drop-in `main.rs`):
 
 ```sh
-# 1. Install the bare-metal Rust target
-rustup target add thumbv7em-none-eabihf
+# copy our files into the shamrocq baremetal example
+cp boilerplate/boilerplate_clean.scm /path/to/shamrocq/examples/baremetal/scheme/demo.scm
+cp tests/baremetal_main.rs /path/to/shamrocq/examples/baremetal/src/main.rs
 
-# 2. Go to the shamrocq baremetal example
+# build and measure
 cd /path/to/shamrocq/examples/baremetal
-
-# 3. Replace the demo scheme file with our boilerplate code
-cp /path/to/poc-shamrocq/boilerplate/boilerplate_clean.scm scheme/demo.scm
-
-# 4. Build in release mode (opt-level "s", LTO enabled)
+rustup target add thumbv7em-none-eabihf
 cargo build --release
-
-# 5. Measure the binary size
-arm-none-eabi-size target/thumbv7em-none-eabihf/release/shamrocq-baremetal
+size target/thumbv7em-none-eabihf/release/shamrocq-baremetal
 ```
 
-The `text` column in the output is the total flash footprint. Compare
-with the C boilerplate compiled for the same target to get an accurate
-side-by-side comparison.
-
-To run on QEMU (requires `qemu-system-arm`):
+To restore shamrocq to its original state:
 
 ```sh
-cargo run --release
+cd /path/to/shamrocq/examples/baremetal
+git checkout -- scheme/demo.scm src/main.rs
 ```
 
 ## Running the VM tests
@@ -178,8 +196,9 @@ cargo run --release
 The PoC functions have been tested on the Shamrocq VM (11 tests passing):
 
 ```sh
+cp poc/poc_clean.scm /path/to/shamrocq/scheme/poc.scm
+cp tests/poc_boilerplate.rs /path/to/shamrocq/crates/shamrocq/tests/poc_boilerplate.rs
 cd /path/to/shamrocq
-cp /path/to/poc-shamrocq/scheme/poc.scm scheme/poc.scm
 cargo test --test poc_boilerplate -- --nocapture
 ```
 
@@ -193,11 +212,11 @@ boilerplate/
 ├── Boilerplate.v             # Rocq source: definitions + proofs + extraction
 ├── _CoqProject               # Rocq project config
 ├── Makefile                   # Build: rocq compile
-├── boilerplate_clean.scm     # Extracted Scheme (header stripped)
+├── boilerplate_clean.scm     # Extracted Scheme (header stripped, optimized)
 ├── README.md                 # This file
 └── out/                      # Generated by shamrocq-compiler (in .gitignore)
-    ├── bytecode.bin           # 9,171 bytes — Shamrocq VM bytecode
+    ├── bytecode.bin           # 1,263 bytes — Shamrocq VM bytecode
     ├── ctors.rs               # Constructor tag constants (23 tags)
-    ├── funcs.rs               # Function entry-point constants (16 globals)
+    ├── funcs.rs               # Function entry-point constants (19 globals)
     └── foreign_fns.rs         # FFI declarations (empty — no host calls)
 ```
